@@ -1,0 +1,1253 @@
+
+
+-- preprocess
+
+
+
+UPDATE la
+SET TenorMonths = CASE 
+        WHEN b.CollateralType = 'Property'  THEN 240
+        WHEN b.CollateralType = 'Deposit'   THEN 12
+        WHEN b.CollateralType = 'Equipment' THEN 60
+        WHEN b.CollateralType = 'Other'     THEN 24
+        WHEN b.CollateralType = 'Gold'      THEN 12
+        WHEN b.CollateralType = 'Vehicle'   THEN 48
+        ELSE 24
+    END
+FROM (
+    SELECT LoanID, CollateralType
+    FROM (
+        SELECT
+            LoanID,
+            CollateralType,
+            ROW_NUMBER() OVER (PARTITION BY LoanID ORDER BY Valuation DESC) AS rn
+        FROM collateral_register
+    ) t
+    WHERE t.rn = 1
+) b
+WHERE la.LoanID = b.LoanID
+  AND la.TenorMonths = 0;
+
+
+UPDATE la
+SET TenorMonths =
+(
+    SELECT MEDIAN(NULLIF(TenorMonths,0)) 
+    FROM la AS x 
+    WHERE x.RiskBand = la.RiskBand
+)
+WHERE TenorMonths = 0;
+
+
+origination date >close date
+
+UPDATE LoanAccounts
+SET CloseDate = NULL
+WHERE CloseDate < OriginationDate;
+
+
+
+-- phase 1
+create or replace database my_database;
+
+create or replace schema my_schema;
+
+use database my_database;
+create or replace role full_access_role;
+create or replace user T1 identified by 'admin123';
+create or replace user T2 identified by 'admin123';
+create or replace user T3 identified by 'admin123';
+create or replace user T4 identified by 'admin123';
+create or replace user T5 identified by 'admin123';
+
+show users;
+grant role accountadmin to user T1;
+grant role accountadmin to user T2;
+grant role accountadmin to user T3;
+grant role accountadmin to user T4;
+grant role accountadmin to user T5;
+
+create or replace file format my_csv_format type='CSV' field_delimiter=',' skip_header=1;
+
+copy iNto LOAN_DATA
+FROM @my_stage file_format=my_csv_format;
+
+create or replace table LOAN_DATA(LoanID int ,CustomerID int,ProductID int,RegionID int,OriginationDate date,APR float,TenorMonths int,OriginationAmount float,CurrentBalance float,Status string,InterestType string,RepaymentFrequency string,RiskBand string,Channel string,CollateralizedFlag int,WriteOffFlag int,ClosedDate date,LastPaymentDate date,Currency string);
+
+-- task 4
+
+use role accountadmin;
+
+CREATE OR REPLACE STORAGE INTEGRATION my_s3_integration
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = S3
+  ENABLED = TRUE
+  STORAGE_AWS_ROLE_ARN ='arn:aws:iam::498504718091:role/s3_snowflake_full_access_raz'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://raziq-snowflakebkt1/Capstone/');
+-- arn:aws:iam::089855661662:user/s64b1000-s
+-- WFC13006_SFCRole=4_yXYbewyXjglomDf8z2gE8HZxvEw=
+desc integration my_s3_integration;
+
+create or replace stage pipe_stage
+URL = 's3://raziq-snowflakebkt1/Capstone/'
+storage_integration = my_s3_integration
+file_format = my_csv_format;
+show pipes;
+
+create or replace table collections_events(
+EventID number,
+LoanID number,
+EventDate date,
+DPD	int,
+ActionType string,
+PTP_Flag int,
+PaymentAmount decimal(10,2),
+AgentID int
+);
+
+  CREATE OR REPLACE PIPE collections_events_pipe
+  AUTO_INGEST = TRUE
+  AS
+  COPY INTO collections_events1
+  FROM @pipe_stage
+  FILE_FORMAT = (TYPE = 'CSV')
+  ON_ERROR = 'CONTINUE';
+
+describe stage pipe_stage;
+select * from collection_events1;
+
+CREATE OR REPLACE PIPE collections_events_pipe
+  AUTO_INGEST = TRUE
+  AS
+  COPY INTO collections_events1
+  FROM @pipe_stage
+  FILE_FORMAT = (TYPE = 'CSV')
+  ON_ERROR = 'CONTINUE';
+select $1 from @pipe_stage;
+
+select system$pipe_status('collections_events_pipe');
+alter PIPE collections_events_pipe refresh;
+
+
+
+
+
+-- phase 2
+
+CREATE or replace TABLE DimCustomer_backup (
+    CustomerSK INT PRIMARY KEY,
+    CustomerID int NOT NULL UNIQUE,
+    customerName VARCHAR(100),  -- masked name
+    Segment VARCHAR(50),
+    RiskBand VARCHAR(20),
+    RegionID int,phone string,email string
+);
+CREATE or replace TABLE DIMPRODUCT_BACKUP (
+    ProductSK INT PRIMARY KEY,
+    ProductID int NOT NULL UNIQUE,
+    LoanType VARCHAR(50),
+    APRTier VARCHAR(20),Tenor varchar(100)
+);
+CREATE or replace TABLE DIMREGION_BACKUP (
+    RegionSK INT  PRIMARY KEY,regionid int not null unique,
+    Country VARCHAR(50),
+    Zone VARCHAR(50),region string,
+    Branch VARCHAR(50),
+    RegionHierarchy VARCHAR(100)
+);
+CREATE or replace TABLE DIMCOLLATERAL_BACKUP (
+    CollateralSK INT  PRIMARY KEY,
+    CollateralID int NOT NULL UNIQUE,loanid int,
+    CollateralType VARCHAR(50),
+    ValuationBand VARCHAR(20)
+);
+
+create or replace table DIMOrigination_time
+
+
+-- dimcollateral dimension
+
+create or replace stream collateral_register_stream_prod on table collateral_register;
+
+MERGE INTO DIMCOLLATERAL_BACKUP AS target
+USING (
+    SELECT
+        row_number() OVER (ORDER BY collateralid) AS collateralSK,
+        COLLATERALID,loanid,
+        COLLATERALTYPE,
+        CASE
+            WHEN VALUATION < 10000 THEN 'Low'
+            WHEN VALUATION <= 50000 THEN 'Medium'
+            ELSE 'High'
+        END AS ValuationBand
+    FROM collateral_register
+) AS source
+ON target.CollateralID = source.CollateralID
+-- Update the record if the match is found
+WHEN MATCHED THEN
+    UPDATE SET
+        target.CollateralType = source.CollateralType,
+        target.ValuationBand = source.ValuationBand,target.loanid=source.loanid
+-- Insert the record if no match is found
+WHEN NOT MATCHED THEN
+    INSERT
+        (collateralsk, CollateralID,loanid, CollateralType, ValuationBand)
+    VALUES
+        (source.collateralSK, source.CollateralID,source.loanid, source.CollateralType, source.ValuationBand);
+
+
+-- dimregion 
+MERGE INTO dimregion_backup AS target
+USING (
+    SELECT
+        ROW_NUMBER() OVER (ORDER BY regionid) AS regionsk,
+        regionid,
+        country,
+        zone,region,
+        branch,
+        CONCAT_WS('>', country, zone, branch) AS regionhierarchy
+    FROM region_hierarchy
+) AS src
+ON target.regionid = src.regionid
+
+-- If the data already exists, update only when there's a change
+WHEN MATCHED AND (
+    target.country != src.country
+    OR target.zone != src.zone
+    OR target.branch != src.branch or target.region !=src.region
+) THEN
+    UPDATE SET
+        target.country = src.country,
+        target.zone = src.zone,
+        target.branch = src.branch,target.region=src.region,
+        target.regionhierarchy = src.regionhierarchy
+-- If the data does not exist, insert new records
+WHEN NOT MATCHED THEN
+    INSERT (regionsk, regionid, country, zone,region, branch, regionhierarchy)
+    VALUES (src.regionsk, src.regionid, src.country, src.zone,src.region, src.branch, src.regionhierarchy);
+
+
+-- Dimcustomer 
+MERGE INTO DimCustomer_backup AS target
+USING (
+    SELECT
+        ROW_NUMBER() OVER (ORDER BY customerid) AS customersk,  -- Surrogate key generation
+        CustomerID,
+        CustomerName,
+        Email,
+        Phone,
+        Age,
+        AnnualIncome,
+        RiskBand,
+        RegionID,
+        CASE
+            WHEN (RiskBand IN ('A', 'B') AND AnnualIncome > 1000000) THEN 'Priority Customer'
+            WHEN (RiskBand IN ('B', 'C') AND AnnualIncome BETWEEN 1000000 AND 3000000) THEN 'Premier Customer'
+            WHEN (RiskBand IN ('D', 'E', 'F') AND AnnualIncome < 100000) THEN 'Value Customer'
+            ELSE 'Standard Customer'
+        END AS Segment
+
+    FROM customer_master) AS source
+ON target.CustomerID = source.CustomerID
+WHEN MATCHED THEN
+    UPDATE SET
+        target.CustomerName = source.CustomerName,
+        target.Segment = source.Segment,
+        target.RiskBand = source.RiskBand,
+        target.RegionID = source.RegionID,
+        target.Phone = source.Phone,
+        target.Email = source.Email
+WHEN NOT MATCHED THEN
+    INSERT (customersk, CustomerID, CustomerName, Segment, RiskBand, RegionID, Phone, Email)
+    VALUES (source.customersk, source.CustomerID, source.CustomerName, source.Segment, source.RiskBand,
+            source.RegionID, source.Phone, source.Email);
+
+
+
+-- dimproduct dimension 
+select * from dimproduct_backup;
+
+MERGE INTO DIMPRODUCT_BACKUP AS target
+USING (
+    SELECT
+        ROW_NUMBER() OVER (ORDER BY la.productid) AS productsk,
+        la.PRODUCTID,
+
+        -- Business Rule: Simple SECURED/UNSECURED based on CollateralID
+        CASE
+            WHEN COUNT(coll.COLLATERALID) > 0 THEN
+                CASE
+                    WHEN COUNT(DISTINCT coll.COLLATERALID) > 1 THEN 'MULTI_SECURED'
+                    WHEN AVG(coll.valuation) > 200000 THEN 'OVER_SECURED'
+                    WHEN AVG(coll.VALUATION) >= 350000 THEN 'FULLY_SECURED'
+                    ELSE 'PARTIALLY_SECURED'
+                END
+            WHEN AVG(la.ORIGINATIONAMOUNT) > 50000 THEN 'LARGE_UNSECURED'
+            WHEN AVG(la.ORIGINATIONAMOUNT) <= 10000 THEN 'SMALL_UNSECURED'
+            ELSE 'STANDARD_UNSECURED'
+        END AS LoanType,
+
+        -- Business Rule: Tenor bands based on average months
+        CASE
+            WHEN AVG(la.TENORMONTHS) <= 3 THEN 'ULTRA_SHORT'
+            WHEN AVG(la.TENORMONTHS) <= 6 THEN 'VERY_SHORT'
+            WHEN AVG(la.TENORMONTHS) <= 12 THEN 'SHORT_TERM'
+            WHEN AVG(la.TENORMONTHS) <= 24 THEN 'MEDIUM_TERM'
+            WHEN AVG(la.TENORMONTHS) <= 36 THEN 'LONG_TERM'
+            WHEN AVG(la.TENORMONTHS) <= 60 THEN 'VERY_LONG'
+            ELSE 'EXTENDED_TERM'
+        END AS Tenor,
+
+        -- Business Rule: APR tiers
+        CASE
+            WHEN AVG(la.APR) < 3 THEN 'PRIME'
+            WHEN AVG(la.APR) < 5 THEN 'PREFERRED'
+            WHEN AVG(la.APR) < 7 THEN 'STANDARD'
+            WHEN AVG(la.APR) < 10 THEN 'NON_PRIME'
+            WHEN AVG(la.APR) < 15 THEN 'SUBPRIME'
+            WHEN AVG(la.APR) < 20 THEN 'HIGH_RISK'
+            ELSE 'SPECIALTY'
+        END AS APRTier
+    FROM dummyloan la
+    LEFT JOIN collateral_register_stream_prod coll ON la.LOANID = coll.LOANID
+    GROUP BY la.PRODUCTID
+) AS source
+ON target.ProductID = source.ProductID
+WHEN NOT MATCHED THEN
+    INSERT (productsk, ProductID, LoanType, Tenor, APRTier)
+    VALUES (source.productsk, source.ProductID, source.LoanType, source.Tenor, source.APRTier);
+
+
+-- dimloan_time
+
+select distinct loanid from collateral_register order by loanid; 
+
+
+    
+
+-- creating fact tables
+
+CREATE OR REPLACE TABLE dummyfactloan (
+    LoanID NUMBER(10,0),
+    CustomerKey INT,
+    ProductKey INT,
+    RegionKey INT,
+    CollateralKey INT,
+    OriginationAmount NUMBER(18,2),
+    APR NUMBER(10,2),
+    Tenor NUMBER(5,0),
+    CurrentBalance NUMBER(18,2),status string,originationdate date
+);
+CREATE OR REPLACE TABLE dummyFactBureau (
+    CustomerSK  INT NOT NULL,              -- FK from DimCustomer
+    BureauScore   INT,
+    Rating        VARCHAR(50),
+    Month         DATE,
+    FOREIGN KEY (CustomerSK) REFERENCES DimCustomer_backup(CustomerSK)
+);
+CREATE OR REPLACE TABLE dummyfactcollections (
+    eventid int,CustomerSK    NUMBER,
+    RegionSK      NUMBER,
+    DPD           NUMBER(18,2),
+    ContactResult VARCHAR(100),
+    PTP           NUMBER(18,2),
+    CurePercent   NUMBER(5,2),
+
+    -- Foreign Key Constraints
+    CONSTRAINT fk_customer FOREIGN KEY (CustomerSK)
+        REFERENCES dimcustomer_backup(CustomerSK),
+    CONSTRAINT fk_region FOREIGN KEY (RegionSK)
+        REFERENCES dimregion_backup(RegionSK)
+);
+
+
+
+-- Task 07 
+select * from dummyfactcollections;
+
+MERGE INTO dummyfactcollections tgt
+USING (
+    SELECT ce.eventid,
+        dc.CustomerSK,
+        dr.RegionSK,
+        ce.DPD,
+        CASE
+            WHEN COALESCE(ce.PaymentAmount,0) > 0 THEN 'Paid'
+            WHEN COALESCE(ce.PTP_Flag,0) = 1 AND COALESCE(ce.PaymentAmount,0) = 0 THEN 'Promise to Pay'
+            WHEN COALESCE(ce.PaymentAmount,0) = 0 AND COALESCE(ce.PTP_Flag,0) = 0 THEN 'Not Connected'
+            ELSE 'No Action'
+        END AS ContactResult,
+
+        ce.PTP_Flag AS PTP,
+
+        ROUND(
+            LEAST(
+                (SUM(ce.PaymentAmount) OVER (PARTITION BY ld.CustomerID) /
+                 NULLIF(SUM(ld.CurrentBalance) OVER (PARTITION BY ld.CustomerID),0)) * 100,
+                100
+            ), 2
+        ) AS CurePercent,ce.eventdate
+    FROM COLLECTION_EVENT ce
+    LEFT JOIN dummyloan ld
+        ON ce.LoanID = ld.LoanID
+    LEFT JOIN dimcustomer_backup dc
+        ON ld.CustomerID = dc.CustomerID
+    LEFT JOIN dimregion_backup dr
+        ON ld.RegionID = dr.RegionID
+) src
+ON tgt.CustomerSK = src.CustomerSK
+   AND tgt.RegionSK = src.RegionSK
+   AND tgt.DPD = src.DPD
+WHEN MATCHED THEN
+    UPDATE SET
+        ContactResult = src.ContactResult,
+        PTP = src.PTP,
+        CurePercent = src.CurePercent
+WHEN NOT MATCHED THEN
+    INSERT (CustomerSK, RegionSK,eventid, DPD, ContactResult, PTP, CurePercent)
+    VALUES (src.CustomerSK, src.RegionSK,src.eventid, src.DPD, src.ContactResult, src.PTP, src.CurePercent);
+
+-- factloan
+ALTER TABLE dummyfactloan ADD FOREIGN KEY (CustomerKey) REFERENCES DimCustomer_backup(Customersk);
+ALTER TABLE dummyfactloan ADD FOREIGN KEY (ProductKey) REFERENCES DimProduct_backup(ProductsK);
+ALTER TABLE dummyfactloan ADD FOREIGN KEY (RegionKey) REFERENCES DimRegion_backup(RegionsK);
+ALTER TABLE dummyFactLoan ADD FOREIGN KEY (CollateralKey) REFERENCES DimCollateral_backup(CollateralsK);
+select * from dummyfactbureau;
+MERGE INTO dummyfactloan AS target
+USING (
+    SELECT 
+        l.LoanID,
+        dc.CustomerSK,
+        dp.ProductSk,
+        dr.RegionSK,
+        COALESCE(dcol.CollateralSK, -1) AS CollateralSK,
+        l.OriginationAmount,
+        l.APR,
+        l.TenorMonths,
+        l.CurrentBalance,l.status,l.originationdate
+    FROM dummyloan l
+    JOIN DimCustomer_backup dc ON l.CustomerID = dc.CustomerID
+    JOIN DIMPRODUCT_BACKUP dp ON l.ProductID = dp.ProductID
+    JOIN DIMREGION_BACKUP dr ON l.RegionID = dr.RegionID
+    LEFT JOIN (
+        SELECT 
+            cr.LoanID,
+            cr.CollateralID,
+            ROW_NUMBER() OVER (PARTITION BY cr.LoanID ORDER BY cr.Valuation DESC) AS rn
+        FROM collateral_register cr
+    ) cr ON l.LoanID = cr.LoanID AND cr.rn = 1
+    LEFT JOIN DIMCOLLATERAL_BACKUP dcol ON cr.CollateralID = dcol.CollateralID
+) AS source
+ON target.LoanID = source.LoanID
+
+WHEN MATCHED THEN UPDATE SET
+    target.Customerkey = source.CustomerSK,
+    target.ProductKey = source.ProductSK,
+    target.RegionKey = source.RegionSK,
+    target.CollateralKey = source.CollateralSK,
+    target.OriginationAmount = source.OriginationAmount,
+    target.APR = source.APR,
+    target.Tenor = source.TenorMonths,
+    target.CurrentBalance = source.CurrentBalance,
+    target.status=source.status
+WHEN NOT MATCHED THEN INSERT (
+    LoanID, Customerkey, ProductKey, Regionkey, Collateralkey,
+    OriginationAmount, APR, Tenor, CurrentBalance,status,originationdate
+)
+VALUES (
+    source.LoanID, source.Customersk, source.ProductSK, source.RegionSK, source.CollateralSK,
+    source.OriginationAmount, source.APR, source.TenorMonths, source.CurrentBalance,source.status,source.originationdate
+);
+
+
+
+select * from dimcustomer_backup;
+-- factbureau 
+
+MERGE INTO dummyFactBureau AS target
+USING (
+    SELECT distinct
+        coalesce(d.CustomerSK,-1) customersk,
+        b.Score AS BureauScore,
+        b.Rating,
+        b.ReportMonth AS Month
+    FROM bureau_scores b
+    LEFT JOIN dimcustomer_backup d
+        ON b.CustomerID = d.CustomerID
+) AS source
+ON (target.CustomerSK = source.CustomerSK)
+WHEN MATCHED THEN
+    UPDATE SET
+        target.BureauScore = source.BureauScore,
+        target.Rating = source.Rating
+WHEN NOT MATCHED THEN
+    INSERT (CustomerSK, BureauScore, Rating, Month)
+    VALUES (source.CustomerSK, source.BureauScore, source.Rating, source.Month);
+
+select * from dummyfactbureau;
+select * from bureau_scores;
+
+
+
+
+
+select distinct * from dummyfactcollections;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- phase 3
+-- task 8
+
+CREATE OR REPLACE STREAM loan_accounts_stream
+ON TABLE dummyloan
+SHOW_INITIAL_ROWS = FALSE;
+select * from dummyloan;
+
+INSERT INTO dummyloan (
+  LOANID, CUSTOMERID, PRODUCTID, REGIONID, ORIGINATIONDATE, APR, TENORMONTHS,
+  ORIGINATIONAMOUNT, CURRENTBALANCE, STATUS, INTERESTTYPE, REPAYMENTFREQUENCY,
+  RISKBAND, CHANNEL, COLLATERALIZEDFLAG, WRITEOFFFLAG, CLOSEDDATE, LASTPAYMENTDATE, CURRENCY
+) VALUES
+(9000000, 107270, 511, 3124, '2022-07-20', 26.8, 9, 1619.22, 9.45, 'Closed', 'Fixed', 'Biweekly', 'A', 'Partner', 0, 0, '2025-08-08', '2025-08-08', 'USD'),
+(9000001, 100860, 507, 3134, '2024-03-24', 11.84, 14, 4187.09, 32.81, 'Closed', 'Variable', 'Monthly', 'B', 'Branch', 0, 0, '2025-09-14', '2025-09-14', 'GBP');
+
+
+UPDATE dummyloan
+SET CURRENTBALANCE = 250.00,
+    STATUS = 'Active'
+WHERE LOANID = 9000000;
+
+UPDATE dummy
+SET APR = 12.50,
+    CHANNEL = 'Partner'
+WHERE LOANID = 9000001;
+
+-- DELETE example (will produce DELETE row in stream)
+DELETE FROM loan_data
+WHERE LOANID = 9000001;
+
+
+select * from loan_data;
+select * from loan_accounts_stream;
+
+
+# stream 2 collection_events
+
+CREATE OR REPLACE STREAM collections_events_stream
+ON TABLE collection_events
+SHOW_INITIAL_ROWS = FALSE;
+
+-- view current table rows
+SELECT * FROM collection_events;
+show tasks;
+
+
+
+-- task 9
+ -- # create task_merge_dimcollateral_hourly
+-- collateral
+CREATE OR REPLACE TASK task_merge_dimcollateral_hourly
+  WAREHOUSE = my_warehouse
+  SCHEDULE = "1 MINUTE"
+AS
+MERGE INTO DIMCOLLATERAL_BACKUP AS target
+USING (
+    SELECT
+        row_number() OVER (ORDER BY collateralid) AS collateralSK,
+        COLLATERALID,
+        COLLATERALTYPE,
+        CASE
+            WHEN VALUATION < 10000 THEN 'Low'
+            WHEN VALUATION <= 50000 THEN 'Medium'
+            ELSE 'High'
+        END AS ValuationBand
+    FROM collateral_register_stream
+) AS source
+ON target.CollateralID = source.CollateralID
+
+-- Update the record if the match is found
+WHEN MATCHED THEN
+    UPDATE SET
+        target.CollateralType = source.CollateralType,
+        target.ValuationBand = source.ValuationBand
+
+-- Insert the record if no match is found
+WHEN NOT MATCHED THEN
+    INSERT
+        (collateralsk, CollateralID, CollateralType, ValuationBand)
+    VALUES
+        (source.collateralSK, source.CollateralID, source.CollateralType, source.ValuationBand);
+alter task task_merge_dimcollateral_hourly resume;
+alter task task_merge_dimcollateral_hourly suspend;
+
+
+-- -----------------------------
+-- #task_merge_dimregion_hourly
+desc table dimregion_backup;
+CREATE OR REPLACE TASK task_merge_dimregion_hourly
+  WAREHOUSE = my_warehouse
+  SCHEDULE = "1 MINUTE"
+AS
+MERGE INTO dimregion_backup AS target
+USING (
+    SELECT
+        ROW_NUMBER() OVER (ORDER BY regionid) AS regionsk,
+        regionid,
+        country,
+        zone,
+        branch,
+        CONCAT_WS('>', country, zone, branch) AS regionhierarchy
+    FROM region_hierarchy_stream
+) AS src
+ON target.regionid = src.regionid
+
+-- If the data already exists, update only when there's a change
+WHEN MATCHED AND (
+    target.country != src.country
+    OR target.zone != src.zone
+    OR target.branch != src.branch
+) THEN
+    UPDATE SET
+        target.country = src.country,
+        target.zone = src.zone,
+        target.branch = src.branch,
+        target.regionhierarchy = src.regionhierarchy
+
+-- If the data does not exist, insert new records
+WHEN NOT MATCHED THEN
+    INSERT (regionsk, regionid, country, zone, branch, regionhierarchy)
+    VALUES (src.regionsk, src.regionid, src.country, src.zone, src.branch, src.regionhierarchy);
+
+alter task task_merge_dimregion_hourly resume;
+alter task task_merge_dimregion_hourly suspend;
+
+-- # create task_merge_dimcustomer_hourly
+-- customer
+CREATE OR REPLACE TASK task_merge_dimcustomer_hourly
+  WAREHOUSE = my_warehouse
+  SCHEDULE = "1 minutes"
+AS
+MERGE INTO DimCustomer_backup AS target
+USING (
+    SELECT
+        ROW_NUMBER() OVER (ORDER BY customerid) AS customersk,  -- Surrogate key generation
+        CustomerID,
+        CustomerName,
+        Email,
+        Phone,
+        Age,
+        AnnualIncome,
+        RiskBand,
+        RegionID,
+
+        CASE
+            WHEN (RiskBand IN ('A', 'B') AND AnnualIncome > 1000000) THEN 'Priority Customer'
+            WHEN (RiskBand IN ('B', 'C') AND AnnualIncome BETWEEN 100000 AND 300000) THEN 'Premier Customer'
+            WHEN (RiskBand IN ('D', 'E', 'F') AND AnnualIncome < 100000) THEN 'Value Customer'
+            ELSE 'Standard Customer'
+        END AS Segment
+
+    FROM customer_master_stream
+) AS source
+ON target.CustomerID = source.CustomerID
+WHEN MATCHED THEN
+    UPDATE SET
+        target.CustomerName = source.CustomerName,
+        target.Segment = source.Segment,
+        target.RiskBand = source.RiskBand,
+        target.RegionID = source.RegionID,
+        target.Phone = source.Phone,
+        target.Email = source.Email
+WHEN NOT MATCHED THEN
+    INSERT (customersk, CustomerID, CustomerName, Segment, RiskBand, RegionID, Phone, Email)
+    VALUES (source.customersk, source.CustomerID, source.CustomerName, source.Segment, source.RiskBand,
+            source.RegionID, source.Phone, source.Email);
+select * from dimcustomer_backup order by customerid;
+
+alter task task_merge_dimcustomer_hourly resume;
+alter task task_merge_dimcustomer_hourly suspend;
+
+
+-- # create task_merge_dimproduct_hourly
+
+CREATE OR REPLACE TASK task_merge_dimproduct_hourly
+  WAREHOUSE = my_warehouse
+  SCHEDULE = "1 minutes"
+AS
+MERGE INTO DIMPRODUCT_BACKUP AS target
+USING (
+    SELECT
+        ROW_NUMBER() OVER (ORDER BY la.productid) AS productsk,
+        la.PRODUCTID,
+
+        -- Business Rule: Simple SECURED/UNSECURED based on CollateralID
+        CASE
+            WHEN COUNT(coll.COLLATERALID) > 0 THEN
+                CASE
+                    WHEN COUNT(DISTINCT coll.COLLATERALID) > 1 THEN 'MULTI_SECURED'
+                    WHEN AVG(coll.valuation) > 200000 THEN 'OVER_SECURED'
+                    WHEN AVG(coll.VALUATION) >= 350000 THEN 'FULLY_SECURED'
+                    ELSE 'PARTIALLY_SECURED'
+                END
+            WHEN AVG(la.ORIGINATIONAMOUNT) > 50000 THEN 'LARGE_UNSECURED'
+            WHEN AVG(la.ORIGINATIONAMOUNT) <= 10000 THEN 'SMALL_UNSECURED'
+            ELSE 'STANDARD_UNSECURED'
+        END AS LoanType,
+
+        -- Business Rule: Tenor bands based on average months
+        CASE
+            WHEN AVG(la.TENORMONTHS) <= 3 THEN 'ULTRA_SHORT'
+            WHEN AVG(la.TENORMONTHS) <= 6 THEN 'VERY_SHORT'
+            WHEN AVG(la.TENORMONTHS) <= 12 THEN 'SHORT_TERM'
+            WHEN AVG(la.TENORMONTHS) <= 24 THEN 'MEDIUM_TERM'
+            WHEN AVG(la.TENORMONTHS) <= 36 THEN 'LONG_TERM'
+            WHEN AVG(la.TENORMONTHS) <= 60 THEN 'VERY_LONG'
+            ELSE 'EXTENDED_TERM'
+        END AS Tenor,
+
+        -- Business Rule: APR tiers
+        CASE
+            WHEN AVG(la.APR) < 3 THEN 'PRIME'
+            WHEN AVG(la.APR) < 5 THEN 'PREFERRED'
+            WHEN AVG(la.APR) < 7 THEN 'STANDARD'
+            WHEN AVG(la.APR) < 10 THEN 'NON_PRIME'
+            WHEN AVG(la.APR) < 15 THEN 'SUBPRIME'
+            WHEN AVG(la.APR) < 20 THEN 'HIGH_RISK'
+            ELSE 'SPECIALTY'
+        END AS APRTier
+    FROM loan_accounts_stream la
+    LEFT JOIN collateral_register_stream coll ON la.LOANID = coll.LOANID
+    GROUP BY la.PRODUCTID
+) AS source
+ON target.ProductID = source.ProductID
+WHEN NOT MATCHED THEN
+    INSERT (productsk, ProductID, LoanType, Tenor, APRTier)
+    VALUES (source.productsk, source.ProductID, source.LoanType, source.Tenor, source.APRTier);
+
+    select * from dimproduct_backup;
+
+alter task task_merge_dimproduct_hourly resume;
+alter task task_merge_dimproduct_hourly suspend;
+
+
+
+-- for factloan
+-- merge for factloan 
+create or replace task task_merge_factloan_hourly warehouse=MY_WAREHOUSE
+schedule="1 minutes" as
+MERGE INTO dummyFactLoan fact
+USING (
+    SELECT
+        stg.loanid,
+        -- Get surrogate keys from dimension tables
+        cust.customersk,  -- From DimCustomer (surrogate key)
+        pro.productsk,    -- From DimProduct (surrogate key)
+        reg.regionsk,     -- From DimRegion (surrogate key)
+        COALESCE(dcol.collateralsk, -1) AS collateralsk,  -- Get collateral key, if available
+        stg.originationamount,
+        stg.apr,
+        stg.tenormonths AS tenor,
+        stg.currentbalance,
+        stg.status
+    FROM loan_accounts_fact_stream stg
+    JOIN dimcustomer_backup cust ON cust.customerid = stg.customerid
+    JOIN dimregion_backup reg ON reg.regionid = stg.regionid
+    JOIN dimproduct_backup pro ON pro.productid = stg.productid
+    LEFT JOIN collateral_register coll ON coll.loanid = stg.loanid
+    LEFT JOIN dimcollateral_backup dcol ON dcol.collateralid = coll.collateralid
+) src
+ON fact.loanid = src.loanid  -- Match on loanid to update if exists
+
+WHEN MATCHED AND (
+    MD5(
+        TO_VARCHAR(fact.customerkey) ||
+        TO_VARCHAR(fact.regionkey) ||
+        TO_VARCHAR(fact.productkey) ||
+        TO_VARCHAR(fact.collateralkey) ||
+        TO_VARCHAR(fact.originationamount) ||
+        TO_VARCHAR(fact.apr) ||
+        TO_VARCHAR(fact.tenor) ||
+        TO_VARCHAR(fact.currentbalance) ||
+        TO_VARCHAR(fact.status)
+    ) !=
+    MD5(
+        TO_VARCHAR(src.customersk) ||
+        TO_VARCHAR(src.regionsk) ||
+        TO_VARCHAR(src.productsk) ||
+        TO_VARCHAR(src.collateralsk) ||
+        TO_VARCHAR(src.originationamount) ||
+        TO_VARCHAR(src.apr) ||
+        TO_VARCHAR(src.tenor) ||
+        TO_VARCHAR(src.currentbalance) ||
+        TO_VARCHAR(src.status)
+    )
+) THEN
+    -- If any of the values have changed, update the fact table
+    UPDATE SET
+        fact.customerkey = src.customersk,
+        fact.regionkey = src.regionsk,
+        fact.productkey = src.productsk,
+        fact.collateralkey = src.collateralsk,
+        fact.originationamount = src.originationamount,
+        fact.apr = src.apr,
+        fact.tenor = src.tenor,
+        fact.currentbalance = src.currentbalance,
+        fact.status = src.status
+
+WHEN NOT MATCHED THEN
+    -- If no match found, insert new record with surrogate keys
+    INSERT (
+        loanid,
+        customerkey,
+        productkey,
+        regionkey,
+        collateralkey,
+        originationamount,
+        apr,
+        tenor,
+        currentbalance,
+        status
+    )
+    VALUES (
+        src.loanid,
+        src.customersk,
+        src.productsk,
+        src.regionsk,
+        src.collateralsk,
+        src.originationamount,
+        src.apr,
+        src.tenor,
+        src.currentbalance,
+        src.status
+    );
+
+alter task task_merge_factloan_hourly resume;
+alter task task_merge_factloan_hourly suspend;
+
+
+-- fact collecction
+CREATE OR REPLACE STREAM collection_events_stream
+ON TABLE collection_events;
+
+CREATE OR REPLACE TABLE audit_log (
+    audit_id NUMBER(38,0),
+    pipeline_name STRING,
+    run_start_time TIMESTAMP,
+    run_end_time TIMESTAMP,
+    total_events_processed NUMBER,
+    total_events_updated NUMBER,
+    total_events_inserted NUMBER,
+    status STRING
+);
+
+
+
+-- # procedure query
+
+CREATE OR REPLACE PROCEDURE sp_update_factcollections()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+
+    CREATE OR REPLACE TEMP TABLE stream_buffer AS
+    SELECT *
+    FROM collection_events_stream;
+
+    CREATE OR REPLACE TEMP TABLE src_data AS
+    SELECT *
+    FROM (
+        SELECT
+            ce.EVENTID,
+            dc.CustomerSK,
+            dr.RegionSK,
+            ce.DPD,
+            ce.PaymentAmount,
+            ce.PTP_Flag AS PTP,
+            CASE
+                WHEN COALESCE(ce.PaymentAmount,0) > 0 THEN 'Paid'
+                WHEN COALESCE(ce.PTP_Flag,0) = 1 AND COALESCE(ce.PaymentAmount,0) = 0 THEN 'Promise to Pay'
+                WHEN COALESCE(ce.PaymentAmount,0) = 0 AND COALESCE(ce.PTP_Flag,0) = 0 THEN 'Not Connected'
+                ELSE 'No Action'
+            END AS ContactResult,
+            ROUND(
+                LEAST(
+                    (SUM(ce.PaymentAmount) OVER (PARTITION BY ld.CustomerID) /
+                     NULLIF(SUM(ld.CurrentBalance) OVER (PARTITION BY ld.CustomerID),0)) * 100,
+                    100
+                ), 2
+            ) AS CurePercent,
+            ROW_NUMBER() OVER (PARTITION BY ce.EVENTID ORDER BY ce.EVENTDATE DESC) AS rn
+        FROM stream_buffer ce
+        LEFT JOIN loan_data ld ON ce.LoanID = ld.LoanID
+        LEFT JOIN dimcustomer dc ON ld.CustomerID = dc.CustomerID
+        LEFT JOIN dimregion dr ON ld.RegionID = dr.RegionID
+    )
+    WHERE rn = 1;
+
+    MERGE INTO factcollections tgt
+    USING src_data src
+    ON tgt.EVENTID = src.EVENTID
+    WHEN MATCHED THEN
+        UPDATE SET
+            DPD = src.DPD,
+            ContactResult = src.ContactResult,
+            PTP = src.PTP,
+            CurePercent = src.CurePercent
+    WHEN NOT MATCHED THEN
+        INSERT (EVENTID, CustomerSK, RegionSK, DPD, ContactResult, PTP, CurePercent)
+        VALUES (src.EVENTID, src.CustomerSK, src.RegionSK, src.DPD, src.ContactResult, src.PTP, src.CurePercent);
+
+    INSERT INTO audit_log (
+        audit_id,
+        pipeline_name,
+        run_start_time,
+        run_end_time,
+        total_events_processed,
+        total_events_updated,
+        total_events_inserted,
+        status
+    )
+    WITH agg AS (
+        SELECT
+            COUNT(*) AS total_events_processed,
+            SUM(CASE WHEN tgt.EVENTID IS NOT NULL THEN 1 ELSE 0 END) AS total_events_updated,
+            SUM(CASE WHEN tgt.EVENTID IS NULL THEN 1 ELSE 0 END) AS total_events_inserted
+        FROM stream_buffer ce
+        LEFT JOIN factcollections tgt ON ce.EVENTID = tgt.EVENTID
+    ),
+    next_id AS (
+        SELECT COALESCE(MAX(audit_id), 0) AS last_id FROM audit_log
+    )
+    SELECT
+        last_id + 1 AS audit_id,
+        'FactCollections_Update',
+        CURRENT_TIMESTAMP,
+        CURRENT_TIMESTAMP,
+        total_events_processed,
+        total_events_updated,
+        total_events_inserted,
+        'SUCCESS'
+    FROM agg
+    CROSS JOIN next_id;
+
+    RETURN 'FactCollections Update Completed';
+END;
+$$;
+
+
+-- task 
+
+CREATE OR REPLACE TASK task_update_factcollections
+  WAREHOUSE = my_warehouse
+  SCHEDULE = 'USING CRON * * * * * UTC'
+  -- schedule = '1 minute'
+AS
+CALL sp_update_factcollections();
+
+ALTER TASK my_schema.task_update_factcollections resume;
+ALTER TASK my_schema.task_update_factcollections suspend;
+
+
+
+
+
+show tasks;
+create or replace task task_update_factbureau 
+warehouse=MY_WAREHOUSE 
+SCHEDULE='USING CRON * * * * * UTC'
+as 
+MERGE INTO dummyFactBureau AS target
+USING (
+    SELECT distinct
+        coalesce(d.CustomerSK,-1) customersk,
+        b.Score AS BureauScore,
+        b.Rating,
+        b.ReportMonth AS Month
+    FROM bureau_score_fact_stream b
+    LEFT JOIN dimcustomer_backup d
+        ON b.CustomerID = d.CustomerID
+) AS source
+ON (target.CustomerSK = source.CustomerSK)
+WHEN MATCHED THEN
+    UPDATE SET
+        target.BureauScore = source.BureauScore,
+        target.Rating = source.Rating
+WHEN NOT MATCHED THEN
+    INSERT (CustomerSK, BureauScore, Rating, Month)
+    VALUES (source.CustomerSK, source.BureauScore, source.Rating, source.Month);
+
+alter task task_update_factbureau resume;
+alter task task_update_factbureau suspend;
+
+
+
+
+
+
+
+
+
+
+show tasks like '%task_update_factcollections';
+show tasks;
+
+select * from collection_events where EVENTID=20000000;
+
+--  update an existing event for checking
+UPDATE collection_events
+SET
+    DPD = 70,
+    ACTIONTYPE = 'Call',
+    PTP_FLAG = 1,
+    PAYMENTAMOUNT = 445.9,
+    AGENTID = 1034,
+    EVENTDATE = '2020-10-25'
+WHERE EVENTID = 20000000;
+
+
+select * from collection_events;
+select * from factcollections where EVENTID=20000000;
+
+select * from audit_log;
+-- truncate table audit_log;
+select * from  collection_events_stream;
+
+-- materialized view
+CREATE or replace TABLE MV_ROLL_RATE10 AS
+SELECT 
+    r.REGIONSK,
+    COUNT(DISTINCT c.CUSTOMERSK) AS totalcustomer,  -- Total number of unique customers in each region
+    COUNT(DISTINCT CASE 
+                    WHEN f.contactresult = 'Paid' THEN c.CUSTOMERSK  -- Customers who have paid
+                    ELSE NULL
+                   END) AS curedcustomer,  -- Customers who are "cured"
+    round(((totalcustomer-curedcustomer)/totalcustomer) * 100,2) AS deliquencypercentage  -- Cured percentage calculation
+FROM 
+    factcollections f
+JOIN 
+    dimcustomer c ON f.CUSTOMERSK = c.CUSTOMERSK
+JOIN 
+    dimregion r ON f.REGIONSK = r.REGIONSK
+WHERE 
+    f.dpd > 0  -- Assuming dpd > 0 indicates an overdue state (adjust this if necessary)
+GROUP BY 
+    r.REGIONSK;
+
+
+select * from factcollections;
+select * from dimregion;
+select * from collection_events;
+select * from mv_roll_rate10;
+
+
+-- materialized views 
+CREATE or replace TABLE MV_ROLL_RATE10 AS
+SELECT 
+    r.REGIONSK,
+    COUNT(DISTINCT c.CUSTOMERSK) AS totalcustomer,  -- Total number of unique customers in each region
+    COUNT(DISTINCT CASE 
+                    WHEN f.contactresult = 'Paid' THEN c.CUSTOMERSK  -- Customers who have paid
+                    ELSE NULL
+                   END) AS curedcustomer,  -- Customers who are "cured"
+    round(((totalcustomer-curedcustomer)/totalcustomer) * 100,2) AS deliquencypercentage  -- Cured percentage calculation
+FROM 
+    dummyfactcollections f
+JOIN 
+    dimcustomer_backup c ON f.CUSTOMERSK = c.CUSTOMERSK
+JOIN 
+    dimregion_backup r ON f.REGIONSK = r.REGIONSK
+WHERE 
+    f.dpd > 0  -- Assuming dpd > 0 indicates an overdue state (adjust this if necessary)
+GROUP BY 
+    r.REGIONSK;
+
+
+select * from factcollections;
+select * from dimregion;
+select * from collection_events;
+select * from mv_roll_rate10;
+
+create or replace secure materialized view mv_roll_rate as select * from mv_roll_rate10;
+
+
+
+create or replace secure materialized view mv_vintage_performance
+as select * from mv_vintage_table
+;
+create or replace table mv_vintage_table as SELECT 
+    -- Truncate the origination date to the month
+    TO_CHAR(DATE_TRUNC('MONTH', la.OriginationDate), 'YYYY-MM') AS OriginationMonth,
+    
+    -- Calculate total losses (based on write-off flag)
+    SUM(CASE 
+        WHEN la.WriteOffFlag = 1 THEN la.OriginationAmount 
+        ELSE 0 
+    END) AS TotalLosses,
+    
+    -- Calculate total current balance (outstanding balance)
+    SUM(la.CurrentBalance) AS TotalCurrentBalance,
+    
+    -- Calculate loss ratio
+    CASE 
+        WHEN SUM(la.CurrentBalance) != 0 THEN
+            round((SUM(CASE 
+                WHEN la.WriteOffFlag = 1 THEN la.OriginationAmount 
+                ELSE 0 
+            END) / SUM(la.CurrentBalance)) * 100,2)
+        ELSE 0
+    END AS LossRatio
+FROM 
+    dummyloan la
+GROUP BY 
+    TO_CHAR(DATE_TRUNC('MONTH', la.OriginationDate), 'YYYY-MM')
+ORDER BY 
+    OriginationMonth;
+
+
+
+
+create or replace table for_mv_collections_effectiveness as
+SELECT
+    fl.LoanID,
+    ce.eventid,
+    curepercent,
+    COUNT(DISTINCT CASE WHEN fc.PTP = 1 THEN ce.EventID END) AS PromisesMade,
+    COUNT(DISTINCT CASE WHEN fc.PTP = 1 AND ce.PaymentAmount > 0 THEN ce.EventID END) AS PromisesKept,
+    ROUND(
+        (COUNT(DISTINCT CASE WHEN  fc.PTP = 1 AND ce.PaymentAmount > 0 THEN ce.EventID END) * 100.0) /
+        NULLIF(COUNT(DISTINCT CASE WHEN fc.PTP = 1 THEN ce.EventID END), 0),
+        2
+    ) AS PTP_Percentage
+FROM dummyFactCollections fc join dummyfactloan fl on fl.customerkey = fc.customersk join collection_events ce on ce.loanid = fl.loanid
+GROUP BY fl.LoanID, curepercent, ce.eventid
+having curepercent > 0
+ORDER BY fl.LoanID;
+select * from for_mv_collections_effectiveness where promisesmade != promiseskept and promiseskept !=0;
+
+create or replace secure materialized view mv_collections_effectiveness
+as
+select loanid, eventid, curepercent, ptp_percentage
+from for_mv_collections_effectiveness;
+
+select * from for_mv_collections_effectiveness ;
+
+
+
+
+select * from mv_collections_effectiveness;
+
+
+-- ----- masking
+
+
+CREATE OR REPLACE MASKING POLICY mask_customer_name AS (CUSTOMERNAME STRING)
+RETURNS STRING ->
+  CASE
+    WHEN CURRENT_ROLE() IN ('ACCOUNTADMIN') THEN CUSTOMERNAME 
+    when current_role() in ('FULL_ACCESS_ROLE') then customername
+    ELSE
+      -- Extract number after underscore
+      CASE
+        WHEN TRY_TO_NUMBER(SPLIT_PART(CUSTOMERNAME, '_', 2)) >= 1000
+          THEN CONCAT('XXXXXXX_', TO_VARCHAR(FLOOR(TRY_TO_NUMBER(SPLIT_PART(CUSTOMERNAME, '_', 2)) / 1000)) || 'K')
+        ELSE
+          CONCAT('XXXXXXX_', SPLIT_PART(CUSTOMERNAME, '_', 2))
+      END
+  END;
+  ALTER TABLE DIMCUSTOMER_BACKUP MODIFY COLUMN CUSTOMERNAME SET MASKING POLICY mask_customer_name;
+    ALTER TABLE DIMCUSTOMER_BACKUP MODIFY COLUMN CUSTOMERNAME UNSET MASKING POLICY ;
+
+------------------MASKING IN EMAIL---------------------
+CREATE OR REPLACE MASKING POLICY mask_email AS (EMAIL STRING)
+RETURNS STRING ->
+  CASE
+    when current_role() in ('FULL_ACCESS_ROLE') then email
+    ELSE 'xxxx@gmail.com'
+  END;
+ALTER TABLE DIMCUSTOMER_BACKUP MODIFY COLUMN EMAIL SET MASKING POLICY mask_email;
+SELECT*FROM DIMCUSTOMER_BACKUP;
+
+------------------MASKING IN PHONE---------------------
+CREATE OR REPLACE MASKING POLICY mask_phone_random AS (PHONE STRING)
+RETURNS STRING ->
+  CASE
+    when current_role() in ('FULL_ACCESS_ROLE') then phone 
+    ELSE
+      CONCAT('(91)XXX-XXX-XX',
+             LPAD(TO_VARCHAR(UNIFORM(10, 99, RANDOM())), 2, '0'))
+  END;
+ALTER TABLE DIMCUSTOMER_BACKUP MODIFY COLUMN PHONE SET MASKING POLICY mask_phone_random;
+ALTER TABLE DIMCUSTOMER_BACKUP MODIFY COLUMN PHONE unSET MASKING POLICY;
+ALTER WAREHOUSE MY_WAREHOUSE SUSPEND;
+SELECT*FROM DIMCUSTOMER_BACKUP;
+
+
+
+
+
+-----------------ROW ACCESS POLICY-------------------------
+CREATE OR REPLACE ROW ACCESS POLICY COUNTRY_ROLE AS (COUNTRY STRING)
+RETURNS BOOLEAN ->
+CASE
+WHEN CURRENT_ROLE() = 'FULL_ACCESS_ROLE' THEN TRUE
+WHEN CURRENT_ROLE()='CAN_ROLE' AND COUNTRY='Canada' THEN TRUE
+WHEN CURRENT_ROLE()='FRANCE_ROLE' AND COUNTRY='France' THEN TRUE
+WHEN CURRENT_ROLE()='GERMANY_ROLE' AND COUNTRY='Germany' THEN TRUE
+WHEN CURRENT_ROLE()='INDIA_ROLE' AND COUNTRY='India' THEN TRUE
+WHEN CURRENT_ROLE()='UK_ROLE' AND COUNTRY='UK' THEN TRUE
+WHEN CURRENT_ROLE()='USA_ROLE' AND COUNTRY='USA' THEN TRUE
+ELSE FALSE
+END;
+
+ALTER TABLE DIMREGION_BACKUP ADD ROW ACCESS POLICY COUNTRY_ROLE ON (COUNTRY);
+ALTER TABLE DIMREGION_backup DROP ROW ACCESS POLICY COUNTRY_ROLE;
+SELECT * FROM DIMREGION_BACKUP;
+
+
+
+
+
+
+-- task 12
+
+
+CREATE or replace SHARE SECURE_view_share;
+
+GRANT USAGE ON DATABASE my_database TO SHARE SECURE_view_share;
+GRANT USAGE ON SCHEMA my_database.my_schema TO SHARE SECURE_view_share;
+GRANT SELECT ON TABLE my_database.my_schema.mv_collections_effectiveness TO SHARE SECURE_view_share;
+GRANT SELECT ON TABLE my_database.my_schema.mv_vintage_performance TO SHARE SECURE_view_share;
+GRANT SELECT ON TABLE my_database.my_schema.mv_roll_rate TO SHARE SECURE_view_share;
+
+ALTER SHARE secure_view_share ADD ACCOUNTS = AHC07218;
+show managed accounts;
+ALTER SHARE secure_view_share SET SECURE_OBJECTS_ONLY = FALSE;
+ALTER SHARE SECURE_VIEW_SHARE ADD ACCOUNTS = reader_account2;
+
+
+CREATE MANAGED ACCOUNT reader_account
+ADMIN_NAME = 'reader_admin'
+ADMIN_PASSWORD = 'Admin@12345678'
+TYPE = READER
+COMMENT = 'Reader account for external partner';
+SHOW MANAGED ACCOUNTS;
+-- UZC79045
+
+show shares;
+
+DROP MANAGED ACCOUNT READER_ACCOUNT;
+
+create or replace materialized view mv_collections_effectiveness as select * from promise_me;
